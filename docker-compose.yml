@@ -1,0 +1,104 @@
+version: '3.9'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment: { ZOOKEEPER_CLIENT_PORT: 2181 }
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fh
+      POSTGRES_PASSWORD: fh
+      POSTGRES_DB: fh
+    ports: ["5432:5432"]
+    volumes: [fh-db:/var/lib/postgresql/data]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [fh-minio:/data]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    command: >
+      sh -c "pip install psycopg2-binary boto3 &&
+             mlflow server --host 0.0.0.0
+             --backend-store-uri postgresql://fh:fh@postgres/fh
+             --default-artifact-root s3://mlflow/
+             --serve-artifacts --artifacts-destination s3://mlflow/"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports: ["5000:5000"]
+    depends_on: [postgres, minio]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  simulator:
+    build: ./simulator
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on: [kafka]
+    restart: unless-stopped
+
+  stream:
+    build: ./stream
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_URI: models:/fraud-xgb/Production
+      REDIS_HOST: redis
+      DB_URL: postgresql://fh:fh@postgres/fh
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on: [kafka, mlflow, redis, postgres]
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    ports: ["8000:8000"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REDIS_HOST: redis
+      DB_URL: postgresql://fh:fh@postgres/fh
+    depends_on: [kafka, redis, postgres]
+
+  ui:
+    build: ./ui
+    ports: ["8501:8501"]
+    environment: { API_URL: http://api:8000 }
+    depends_on: [api]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes: [./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    environment: { GF_SECURITY_ADMIN_PASSWORD: admin }
+
+volumes:
+  fh-db:
+  fh-minio:
